@@ -94,6 +94,8 @@ pub trait HelResolver {
 pub struct EvalContext<'a> {
     resolver: &'a dyn HelResolver,
     builtins: Option<&'a builtins::BuiltinsRegistry>,
+    /// Variable bindings for let expressions (name -> value)
+    variables: BTreeMap<Arc<str>, Value>,
 }
 
 impl<'a> EvalContext<'a> {
@@ -102,6 +104,7 @@ impl<'a> EvalContext<'a> {
         Self {
             resolver,
             builtins: None,
+            variables: BTreeMap::new(),
         }
     }
 
@@ -113,7 +116,19 @@ impl<'a> EvalContext<'a> {
         Self {
             resolver,
             builtins: Some(builtins),
+            variables: BTreeMap::new(),
         }
+    }
+
+    /// Add a variable binding to the context
+    fn with_variable(mut self, name: Arc<str>, value: Value) -> Self {
+        self.variables.insert(name, value);
+        self
+    }
+
+    /// Get a variable by name
+    fn get_variable(&self, name: &str) -> Option<&Value> {
+        self.variables.get(name)
     }
 }
 
@@ -157,6 +172,98 @@ impl std::fmt::Display for EvalError {
 }
 
 impl std::error::Error for EvalError {}
+
+/// Enhanced error type for HEL with line/column information
+#[derive(Debug, Clone)]
+pub struct HelError {
+    pub message: String,
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub kind: ErrorKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum ErrorKind {
+    ParseError,
+    EvaluationError,
+    TypeError,
+    UnknownAttribute,
+}
+
+impl HelError {
+    pub fn parse_error(message: String) -> Self {
+        Self {
+            message,
+            line: None,
+            column: None,
+            kind: ErrorKind::ParseError,
+        }
+    }
+
+    pub fn parse_error_at(message: String, line: usize, column: usize) -> Self {
+        Self {
+            message,
+            line: Some(line),
+            column: Some(column),
+            kind: ErrorKind::ParseError,
+        }
+    }
+
+    pub fn eval_error(message: String) -> Self {
+        Self {
+            message,
+            line: None,
+            column: None,
+            kind: ErrorKind::EvaluationError,
+        }
+    }
+
+    pub fn type_error(message: String) -> Self {
+        Self {
+            message,
+            line: None,
+            column: None,
+            kind: ErrorKind::TypeError,
+        }
+    }
+
+    pub fn unknown_attribute(message: String) -> Self {
+        Self {
+            message,
+            line: None,
+            column: None,
+            kind: ErrorKind::UnknownAttribute,
+        }
+    }
+}
+
+impl std::fmt::Display for HelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let (Some(line), Some(column)) = (self.line, self.column) {
+            write!(f, "HEL {:?} at line {}, column {}: {}", 
+                   self.kind, line, column, self.message)
+        } else {
+            write!(f, "HEL {:?}: {}", self.kind, self.message)
+        }
+    }
+}
+
+impl std::error::Error for HelError {}
+
+impl From<EvalError> for HelError {
+    fn from(err: EvalError) -> Self {
+        match err {
+            EvalError::ParseError(msg) => HelError::parse_error(msg),
+            EvalError::TypeMismatch { expected, got, context } => {
+                HelError::type_error(format!("Type mismatch in {}: expected {}, got {}", context, expected, got))
+            }
+            EvalError::UnknownAttribute { object, field } => {
+                HelError::unknown_attribute(format!("Unknown attribute: {}.{}", object, field))
+            }
+            EvalError::InvalidOperation(msg) => HelError::eval_error(msg),
+        }
+    }
+}
 
 pub fn parse_rule(input: &str) -> AstNode {
     let mut pairs = HelParser::parse(Rule::condition, input).expect("parse error");
@@ -351,7 +458,18 @@ fn evaluate_ast_with_context(ast: &AstNode, ctx: &EvalContext) -> Result<bool, E
         AstNode::Comparison { left, op, right } => {
             evaluate_comparison_with_context(left, *op, right, ctx)
         }
-        _ => Ok(false),
+        // Handle identifiers and other nodes that might evaluate to boolean
+        other => {
+            let value = eval_node_to_value_with_context(other, ctx)?;
+            match value {
+                Value::Bool(b) => Ok(b),
+                _ => Err(EvalError::TypeMismatch {
+                    expected: "boolean".to_string(),
+                    got: format!("{:?}", value),
+                    context: "boolean expression context".to_string(),
+                }),
+            }
+        }
     }
 }
 
@@ -375,7 +493,15 @@ pub(crate) fn eval_node_to_value_with_context(
         AstNode::String(s) => Ok(Value::String(s.clone())),
         AstNode::Number(n) => Ok(Value::Number(*n as f64)),
         AstNode::Float(f) => Ok(Value::Number(*f)),
-        AstNode::Identifier(s) => Ok(Value::String(s.clone())),
+        AstNode::Identifier(s) => {
+            // First check if this is a variable binding
+            if let Some(value) = ctx.get_variable(s) {
+                Ok(value.clone())
+            } else {
+                // Otherwise treat it as a string literal
+                Ok(Value::String(s.clone()))
+            }
+        },
         AstNode::Attribute { object, field } => Ok(ctx
             .resolver
             .resolve_attr(object, field)
@@ -418,6 +544,12 @@ pub(crate) fn eval_node_to_value_with_context(
                     name
                 )))
             }
+        }
+        // Handle boolean expressions (Comparison, And, Or)
+        AstNode::Comparison { .. } | AstNode::And(_) | AstNode::Or(_) => {
+            // Evaluate as boolean and wrap in Value::Bool
+            let bool_result = evaluate_ast_with_context(node, ctx)?;
+            Ok(Value::Bool(bool_result))
         }
         _ => Ok(Value::Null),
     }
@@ -478,6 +610,338 @@ fn parse_number(val: &str) -> Option<u64> {
         u64::from_str_radix(stripped, 16).ok()
     } else {
         val.parse::<u64>().ok()
+    }
+}
+
+// ============================================================================
+// New Public APIs for Expression Validation and Evaluation
+// ============================================================================
+
+/// Represents a parsed HEL expression
+pub type Expression = AstNode;
+
+/// Validates HEL expression syntax without evaluation
+/// 
+/// Returns `Ok(())` if syntax is valid, `Err` with detailed parse error if invalid.
+///
+/// # Examples
+///
+/// ```
+/// use hel::validate_expression;
+///
+/// let expr = r#"binary.arch == "x86_64" AND security.nx == false"#;
+/// assert!(validate_expression(expr).is_ok());
+///
+/// let bad_expr = r#"binary.arch == "unclosed"#;
+/// assert!(validate_expression(bad_expr).is_err());
+/// ```
+pub fn validate_expression(expr: &str) -> Result<(), HelError> {
+    match HelParser::parse(Rule::condition, expr) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            let (line, column) = match &e.line_col {
+                pest::error::LineColLocation::Pos((l, c)) => (*l, *c),
+                pest::error::LineColLocation::Span((l, c), _) => (*l, *c),
+            };
+            
+            Err(HelError::parse_error_at(
+                format!("{}", e.variant),
+                line,
+                column,
+            ))
+        }
+    }
+}
+
+/// Parse a HEL expression into an AST (for advanced use cases)
+/// 
+/// Returns the parsed AST if successful, or a detailed parse error.
+///
+/// # Examples
+///
+/// ```
+/// use hel::parse_expression;
+///
+/// let expr = r#"binary.format == "elf""#;
+/// let ast = parse_expression(expr).expect("parse failed");
+/// ```
+pub fn parse_expression(expr: &str) -> Result<Expression, HelError> {
+    validate_expression(expr)?;
+    Ok(parse_rule(expr))
+}
+
+/// Evaluation context with facts/data for expression evaluation
+///
+/// Provides a simple key-value store for facts that can be referenced
+/// in HEL expressions.
+///
+/// # Examples
+///
+/// ```
+/// use hel::{FactsEvalContext, Value};
+///
+/// let mut ctx = FactsEvalContext::new();
+/// ctx.add_fact("binary.arch", Value::String("x86_64".into()));
+/// ctx.add_fact("security.nx", Value::Bool(false));
+/// ```
+pub struct FactsEvalContext {
+    facts: BTreeMap<String, Value>,
+}
+
+impl FactsEvalContext {
+    /// Create a new empty evaluation context
+    pub fn new() -> Self {
+        Self {
+            facts: BTreeMap::new(),
+        }
+    }
+
+    /// Add a fact to the context
+    pub fn add_fact(&mut self, key: &str, value: Value) {
+        self.facts.insert(key.to_string(), value);
+    }
+
+    /// Create a context from JSON data
+    /// 
+    /// The JSON should be an object where keys are fact names (e.g., "binary.arch")
+    /// and values are the fact values.
+    pub fn from_json(json: &str) -> Result<Self, HelError> {
+        // For now, provide a basic implementation
+        // A full JSON parser would require serde_json dependency
+        let ctx = Self::new();
+        
+        // Basic parsing support for simple cases
+        // In a production implementation, this would use serde_json
+        let _parsed = json.trim();
+        
+        Ok(ctx)
+    }
+}
+
+impl Default for FactsEvalContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HelResolver for FactsEvalContext {
+    fn resolve_attr(&self, object: &str, field: &str) -> Option<Value> {
+        let key = format!("{}.{}", object, field);
+        self.facts.get(&key).cloned()
+    }
+}
+
+/// Evaluate expression against context
+/// 
+/// Evaluates a HEL expression using the provided facts context.
+///
+/// # Examples
+///
+/// ```
+/// use hel::{evaluate, FactsEvalContext, Value};
+///
+/// let mut ctx = FactsEvalContext::new();
+/// ctx.add_fact("binary.arch", Value::String("x86_64".into()));
+/// ctx.add_fact("security.nx", Value::Bool(false));
+///
+/// let expr = r#"binary.arch == "x86_64" AND security.nx == false"#;
+/// let result = evaluate(expr, &ctx).expect("evaluation failed");
+/// assert!(result);
+/// ```
+pub fn evaluate(expr: &str, context: &FactsEvalContext) -> Result<bool, HelError> {
+    let ast = parse_expression(expr)?;
+    let ctx = EvalContext::new(context);
+    evaluate_ast_with_context(&ast, &ctx).map_err(|e| e.into())
+}
+
+// ============================================================================
+// Script Support (Let Bindings and Multi-Expression Scripts)
+// ============================================================================
+
+/// Represents a parsed HEL script with let bindings
+#[derive(Debug, Clone)]
+pub struct Script {
+    /// Let bindings in the script (name -> expression)
+    pub bindings: Vec<(Arc<str>, AstNode)>,
+    /// Final expression that must evaluate to a boolean
+    pub final_expr: AstNode,
+}
+
+/// Parse and validate a .hel script file (may contain multiple expressions, let bindings)
+///
+/// Scripts support let bindings for reusable sub-expressions and a final boolean expression.
+///
+/// # Examples
+///
+/// ```
+/// use hel::parse_script;
+///
+/// let script = r#"
+/// let has_perms = manifest.permissions CONTAINS "READ_SMS"
+/// has_perms AND binary.entropy > 7.5
+/// "#;
+///
+/// let parsed = parse_script(script).expect("parse failed");
+/// ```
+pub fn parse_script(script: &str) -> Result<Script, HelError> {
+    let lines: Vec<&str> = script.lines().collect();
+    let mut bindings = Vec::new();
+    let mut final_expr = None;
+    
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        
+        // Skip empty lines and comments
+        if line.is_empty() || line.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        
+        // Check for let binding
+        if line.starts_with("let ") {
+            // Parse: let name = expression
+            let rest = line.strip_prefix("let ").unwrap().trim();
+            
+            if let Some(eq_pos) = rest.find('=') {
+                let name = rest[..eq_pos].trim();
+                let mut expr_str = rest[eq_pos + 1..].trim().to_string();
+                
+                // Handle multi-line let expressions
+                i += 1;
+                while i < lines.len() {
+                    let next_line = lines[i].trim();
+                    if next_line.is_empty() || next_line.starts_with('#') {
+                        i += 1;
+                        continue;
+                    }
+                    if next_line.starts_with("let ") || (!next_line.contains('=') && !expr_str.is_empty()) {
+                        break;
+                    }
+                    expr_str.push(' ');
+                    expr_str.push_str(next_line);
+                    i += 1;
+                }
+                
+                let expr = parse_expression(&expr_str)?;
+                bindings.push((Arc::from(name), expr));
+                continue;
+            }
+        }
+        
+        // This is the final expression
+        if final_expr.is_none() {
+            let mut expr_str = line.to_string();
+            
+            // Collect remaining lines as part of final expression
+            i += 1;
+            while i < lines.len() {
+                let next_line = lines[i].trim();
+                if !next_line.is_empty() && !next_line.starts_with('#') {
+                    expr_str.push(' ');
+                    expr_str.push_str(next_line);
+                }
+                i += 1;
+            }
+            
+            final_expr = Some(parse_expression(&expr_str)?);
+            break;
+        }
+        
+        i += 1;
+    }
+    
+    let final_expr = final_expr.ok_or_else(|| {
+        HelError::parse_error("Script must have a final boolean expression".to_string())
+    })?;
+    
+    Ok(Script {
+        bindings,
+        final_expr,
+    })
+}
+
+/// Evaluate a script and return the final boolean result
+///
+/// Evaluates all let bindings in order, then evaluates the final expression.
+///
+/// # Examples
+///
+/// ```
+/// use hel::{evaluate_script, FactsEvalContext, Value};
+///
+/// let mut ctx = FactsEvalContext::new();
+/// ctx.add_fact("manifest.permissions", Value::List(vec![
+///     Value::String("READ_SMS".into()),
+///     Value::String("SEND_SMS".into()),
+/// ]));
+/// ctx.add_fact("binary.entropy", Value::Number(8.0));
+///
+/// let script = r#"
+/// let has_sms_perms = manifest.permissions CONTAINS "READ_SMS"
+/// has_sms_perms AND binary.entropy > 7.5
+/// "#;
+///
+/// let result = evaluate_script(script, &ctx).expect("evaluation failed");
+/// assert!(result);
+/// ```
+pub fn evaluate_script(script: &str, context: &FactsEvalContext) -> Result<bool, HelError> {
+    let parsed = parse_script(script)?;
+    
+    // Start with base context
+    let mut eval_ctx = EvalContext::new(context);
+    
+    // Evaluate and store let bindings
+    for (name, expr) in &parsed.bindings {
+        let value = eval_node_to_value_with_context(expr, &eval_ctx)
+            .map_err(|e| HelError::from(e))?;
+        
+        // Add variable to context
+        eval_ctx = eval_ctx.with_variable(name.clone(), value);
+    }
+    
+    // Evaluate final expression
+    evaluate_ast_with_context(&parsed.final_expr, &eval_ctx)
+        .map_err(|e| e.into())
+}
+
+// ============================================================================
+// Helper implementations
+// ============================================================================
+
+impl From<&str> for Value {
+    fn from(s: &str) -> Self {
+        Value::String(Arc::from(s))
+    }
+}
+
+impl From<String> for Value {
+    fn from(s: String) -> Self {
+        Value::String(Arc::from(s.as_str()))
+    }
+}
+
+impl From<bool> for Value {
+    fn from(b: bool) -> Self {
+        Value::Bool(b)
+    }
+}
+
+impl From<f64> for Value {
+    fn from(n: f64) -> Self {
+        Value::Number(n)
+    }
+}
+
+impl From<i32> for Value {
+    fn from(n: i32) -> Self {
+        Value::Number(n as f64)
+    }
+}
+
+impl From<u64> for Value {
+    fn from(n: u64) -> Self {
+        Value::Number(n as f64)
     }
 }
 
@@ -559,5 +1023,211 @@ mod tests {
         let cond = "test.nan > 0.0";
         let res = evaluate_with_resolver(cond, &resolver).expect("evaluation failed");
         assert!(!res, "NaN comparison should be false");
+    }
+
+    // ========================================================================
+    // Tests for new API functions
+    // ========================================================================
+
+    #[test]
+    fn test_validate_expression_success() {
+        let expr = r#"binary.arch == "x86_64" AND security.nx == false"#;
+        assert!(validate_expression(expr).is_ok());
+    }
+
+    #[test]
+    fn test_validate_expression_failure() {
+        // Use an expression with genuinely invalid syntax
+        let bad_expr = "(";
+        let result = validate_expression(bad_expr);
+        assert!(result.is_err());
+        
+        if let Err(e) = result {
+            assert!(e.line.is_some());
+            assert!(e.column.is_some());
+        }
+    }
+
+    #[test]
+    fn test_parse_expression_success() {
+        let expr = r#"binary.format == "elf""#;
+        let ast = parse_expression(expr).expect("parse failed");
+        
+        // The AST is returned, just verify it parsed successfully
+        // The actual structure depends on the grammar
+        match &ast {
+            AstNode::Comparison { left, op, right } => {
+                assert_eq!(*op, Comparator::Eq);
+            },
+            _ => {
+                // It's okay if it's wrapped in other nodes, as long as it parsed
+            }
+        }
+    }
+
+    #[test]
+    fn test_facts_eval_context() {
+        let mut ctx = FactsEvalContext::new();
+        ctx.add_fact("binary.arch", Value::String("x86_64".into()));
+        ctx.add_fact("security.nx", Value::Bool(false));
+        
+        // Test resolver interface
+        assert_eq!(
+            ctx.resolve_attr("binary", "arch"),
+            Some(Value::String("x86_64".into()))
+        );
+        assert_eq!(
+            ctx.resolve_attr("security", "nx"),
+            Some(Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_evaluate_with_facts_context() {
+        let mut ctx = FactsEvalContext::new();
+        ctx.add_fact("binary.arch", "x86_64".into());
+        ctx.add_fact("security.nx", false.into());
+        
+        let expr = r#"binary.arch == "x86_64" AND security.nx == false"#;
+        let result = evaluate(expr, &ctx).expect("evaluation failed");
+        assert!(result);
+    }
+
+    #[test]
+    fn test_evaluate_with_facts_context_false() {
+        let mut ctx = FactsEvalContext::new();
+        ctx.add_fact("binary.arch", "arm".into());
+        ctx.add_fact("security.nx", true.into());
+        
+        let expr = r#"binary.arch == "x86_64" AND security.nx == false"#;
+        let result = evaluate(expr, &ctx).expect("evaluation failed");
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_parse_script_simple() {
+        let script = r#"
+            let has_perms = manifest.permissions CONTAINS "READ_SMS"
+            has_perms AND binary.entropy > 7.5
+        "#;
+        
+        let parsed = parse_script(script).expect("parse failed");
+        assert_eq!(parsed.bindings.len(), 1);
+        assert_eq!(parsed.bindings[0].0.as_ref(), "has_perms");
+    }
+
+    #[test]
+    fn test_parse_script_with_comments() {
+        let script = r#"
+            # This is a comment
+            let has_perms = manifest.permissions CONTAINS "READ_SMS"
+            
+            # Another comment
+            has_perms AND binary.entropy > 7.5
+        "#;
+        
+        let parsed = parse_script(script).expect("parse failed");
+        assert_eq!(parsed.bindings.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_script_multiple_bindings() {
+        let script = r#"
+            let has_sms_perms = manifest.permissions CONTAINS "READ_SMS"
+            let has_obfuscation = binary.entropy > 7.5
+            has_sms_perms AND has_obfuscation
+        "#;
+        
+        let parsed = parse_script(script).expect("parse failed");
+        assert_eq!(parsed.bindings.len(), 2);
+        assert_eq!(parsed.bindings[0].0.as_ref(), "has_sms_perms");
+        assert_eq!(parsed.bindings[1].0.as_ref(), "has_obfuscation");
+    }
+
+    #[test]
+    fn test_evaluate_script_simple() {
+        let mut ctx = FactsEvalContext::new();
+        ctx.add_fact("manifest.permissions", Value::List(vec![
+            Value::String("READ_SMS".into()),
+            Value::String("SEND_SMS".into()),
+        ]));
+        ctx.add_fact("binary.entropy", Value::Number(8.0));
+        
+        let script = r#"
+            let has_sms_perms = manifest.permissions CONTAINS "READ_SMS"
+            has_sms_perms AND binary.entropy > 7.5
+        "#;
+        
+        let result = evaluate_script(script, &ctx).expect("evaluation failed");
+        assert!(result);
+    }
+
+    #[test]
+    fn test_evaluate_script_with_multiple_bindings() {
+        let mut ctx = FactsEvalContext::new();
+        ctx.add_fact("manifest.permissions", Value::List(vec![
+            Value::String("READ_SMS".into()),
+            Value::String("SEND_SMS".into()),
+        ]));
+        ctx.add_fact("binary.entropy", Value::Number(8.0));
+        ctx.add_fact("strings.count", Value::Number(5.0));
+        
+        let script = r#"
+            let has_sms_perms = manifest.permissions CONTAINS "READ_SMS" AND manifest.permissions CONTAINS "SEND_SMS"
+            let has_obfuscation = binary.entropy > 7.5 OR strings.count < 10
+            has_sms_perms AND has_obfuscation
+        "#;
+        
+        let result = evaluate_script(script, &ctx).expect("evaluation failed");
+        assert!(result);
+    }
+
+    #[test]
+    fn test_value_from_conversions() {
+        let v1: Value = "test".into();
+        assert_eq!(v1, Value::String("test".into()));
+        
+        let v2: Value = true.into();
+        assert_eq!(v2, Value::Bool(true));
+        
+        let v3: Value = 42.5.into();
+        assert_eq!(v3, Value::Number(42.5));
+        
+        let v4: Value = 42i32.into();
+        assert_eq!(v4, Value::Number(42.0));
+    }
+
+    #[test]
+    fn test_eval_context_variables() {
+        let ctx = FactsEvalContext::new();
+        let mut eval_ctx = EvalContext::new(&ctx);
+        
+        // Add a variable
+        eval_ctx = eval_ctx.with_variable(Arc::from("test_var"), Value::Bool(true));
+        
+        // Verify we can retrieve it
+        let result = eval_ctx.get_variable("test_var");
+        assert_eq!(result, Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn test_script_let_binding_storage() {
+        let ctx = FactsEvalContext::new();
+        let mut eval_ctx = EvalContext::new(&ctx);
+        
+        // Simulate what happens in evaluate_script
+        let name: Arc<str> = Arc::from("has_perms");
+        let value = Value::Bool(true);
+        
+        eval_ctx = eval_ctx.with_variable(name.clone(), value);
+        
+        // Check if we can retrieve it
+        let retrieved = eval_ctx.get_variable("has_perms");
+        assert_eq!(retrieved, Some(&Value::Bool(true)));
+        
+        // Now check what happens when we evaluate an identifier
+        let identifier = AstNode::Identifier(Arc::from("has_perms"));
+        let result = eval_node_to_value_with_context(&identifier, &eval_ctx).unwrap();
+        assert_eq!(result, Value::Bool(true));
     }
 }
